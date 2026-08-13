@@ -213,6 +213,7 @@ public:
 
     void finishSpv(bool compileOnly);
     void dumpSpv(std::vector<unsigned int>& out);
+    bool hasInvalidTree() const { return invalidTree; }
 
 protected:
     friend class DescHeapLayoutEmitter;
@@ -341,6 +342,16 @@ protected:
 
     // There is a 1:1 mapping between a spv builder and a module; this is thread safe
     spv::Builder builder;
+    // Front-end error recovery can leave a malformed binary node behind even
+    // when parsing reports a diagnostic.  Do not let the back-end walk that
+    // partial tree and turn it into a native null dereference.
+    bool invalidTree = false;
+
+    void failInvalidTree(const char* message)
+    {
+        invalidTree = true;
+        logger->missingFunctionality(message);
+    }
     bool inEntryPoint;
     bool entryPointTerminated;
     bool linkageOnly;                  // true when visiting the set of objects in the AST present only for
@@ -2325,6 +2336,9 @@ void TGlslangToSpvTraverser::dumpSpv(std::vector<unsigned int>& out)
 //
 void TGlslangToSpvTraverser::visitSymbol(glslang::TIntermSymbol* symbol)
 {
+    if (invalidTree)
+        return;
+
     // We update the line information even though no code might be generated here
     // This is helpful to yield correct lines for control flow instructions
     if (!linkageOnly) {
@@ -2540,6 +2554,14 @@ void TGlslangToSpvTraverser::recordDescHeapAccessChainInfo(glslang::TIntermBinar
 
 bool TGlslangToSpvTraverser::visitBinary(glslang::TVisit /* visit */, glslang::TIntermBinary* node)
 {
+    if (invalidTree)
+        return false;
+
+    if (node == nullptr) {
+        failInvalidTree("null glslang binary node");
+        return false;
+    }
+
     builder.setDebugSourceLocation(node->getLoc().line, node->getLoc().getFilename());
 
     SpecConstantOpModeGuard spec_constant_op_mode_setter(&builder);
@@ -2759,9 +2781,17 @@ bool TGlslangToSpvTraverser::visitBinary(glslang::TVisit /* visit */, glslang::T
         return false;
     case glslang::EOpVectorSwizzle:
         {
-            node->getLeft()->traverse(this);
+            glslang::TIntermTyped* left = node->getLeft();
+            glslang::TIntermTyped* right = node->getRight();
+            glslang::TIntermAggregate* selectors = right != nullptr
+                ? right->getAsAggregate() : nullptr;
+            if (left == nullptr || selectors == nullptr) {
+                failInvalidTree("malformed glslang vector swizzle");
+                return false;
+            }
+            left->traverse(this);
             std::vector<unsigned> swizzle;
-            convertSwizzle(*node->getRight()->getAsAggregate(), swizzle);
+            convertSwizzle(*selectors, swizzle);
             int dummySize;
             builder.accessChainPushSwizzle(swizzle, convertGlslangToSpvType(node->getLeft()->getType()),
                                            TranslateCoherent(node->getLeft()->getType()),
@@ -2950,6 +2980,9 @@ spv::Id TGlslangToSpvTraverser::translateForcedType(spv::Id object)
 
 bool TGlslangToSpvTraverser::visitUnary(glslang::TVisit /* visit */, glslang::TIntermUnary* node)
 {
+    if (invalidTree)
+        return false;
+
     builder.setDebugSourceLocation(node->getLoc().line, node->getLoc().getFilename());
 
     SpecConstantOpModeGuard spec_constant_op_mode_setter(&builder);
@@ -3437,6 +3470,9 @@ void TGlslangToSpvTraverser::createAbortEXT(const glslang::TIntermSequence &glsl
 
 bool TGlslangToSpvTraverser::visitAggregate(glslang::TVisit visit, glslang::TIntermAggregate* node)
 {
+    if (invalidTree)
+        return false;
+
     SpecConstantOpModeGuard spec_constant_op_mode_setter(&builder);
     if (node->getType().getQualifier().isSpecConstant())
         spec_constant_op_mode_setter.turnOnSpecConstantOpMode();
@@ -3752,6 +3788,8 @@ bool TGlslangToSpvTraverser::visitAggregate(glslang::TVisit visit, glslang::TInt
         builder.setDebugSourceLocation(node->getLoc().line, node->getLoc().getFilename());
         std::vector<spv::Id> arguments;
         translateArguments(*node, arguments, lvalueCoherentFlags);
+        if (invalidTree)
+            return false;
         spv::Id constructed;
         if (node->getOp() == glslang::EOpConstructTextureSampler) {
             const glslang::TType& texType = node->getSequence()[0]->getAsTyped()->getType();
@@ -4579,6 +4617,9 @@ bool TGlslangToSpvTraverser::visitAggregate(glslang::TVisit visit, glslang::TInt
         }
     }
 
+    if (invalidTree)
+        return false;
+
     builder.setDebugSourceLocation(node->getLoc().line, node->getLoc().getFilename());
     if (node->getOp() == glslang::EOpCooperativeMatrixLoadTensorNV) {
         std::vector<spv::IdImmediate> idImmOps;
@@ -5130,6 +5171,9 @@ bool TGlslangToSpvTraverser::visitAggregate(glslang::TVisit visit, glslang::TInt
 // next layer copies r-values into memory to use the access-chain mechanism
 bool TGlslangToSpvTraverser::visitSelection(glslang::TVisit /* visit */, glslang::TIntermSelection* node)
 {
+    if (invalidTree)
+        return false;
+
     // see if OpSelect can handle it
     const auto isOpSelectable = [&]() {
         if (node->getBasicType() == glslang::EbtVoid)
@@ -5318,6 +5362,9 @@ bool TGlslangToSpvTraverser::visitSelection(glslang::TVisit /* visit */, glslang
 
 bool TGlslangToSpvTraverser::visitSwitch(glslang::TVisit /* visit */, glslang::TIntermSwitch* node)
 {
+    if (invalidTree)
+        return false;
+
     // emit and get the condition before doing anything with switch
     node->getCondition()->traverse(this);
     spv::Id selector = accessChainLoad(node->getCondition()->getAsTyped()->getType());
@@ -5372,6 +5419,9 @@ bool TGlslangToSpvTraverser::visitSwitch(glslang::TVisit /* visit */, glslang::T
 
 void TGlslangToSpvTraverser::visitConstantUnion(glslang::TIntermConstantUnion* node)
 {
+    if (invalidTree)
+        return;
+
     if (node->getQualifier().isSpirvLiteral())
         return; // Translated to a literal value, skip further processing
 
@@ -5384,6 +5434,9 @@ void TGlslangToSpvTraverser::visitConstantUnion(glslang::TIntermConstantUnion* n
 
 bool TGlslangToSpvTraverser::visitLoop(glslang::TVisit /* visit */, glslang::TIntermLoop* node)
 {
+    if (invalidTree)
+        return false;
+
     auto blocks = builder.makeNewLoop();
     builder.createBranch(true, &blocks.head);
 
@@ -5453,6 +5506,9 @@ bool TGlslangToSpvTraverser::visitLoop(glslang::TVisit /* visit */, glslang::TIn
 
 bool TGlslangToSpvTraverser::visitBranch(glslang::TVisit /* visit */, glslang::TIntermBranch* node)
 {
+    if (invalidTree)
+        return false;
+
     if (node->getExpression())
         node->getExpression()->traverse(this);
 
@@ -5526,6 +5582,9 @@ bool TGlslangToSpvTraverser::visitBranch(glslang::TVisit /* visit */, glslang::T
 
 bool TGlslangToSpvTraverser::visitVariableDecl(glslang::TVisit visit, glslang::TIntermVariableDecl* node)
 {
+    if (invalidTree)
+        return false;
+
     if (visit == glslang::EvPreVisit) {
         builder.setDebugSourceLocation(node->getDeclSymbol()->getLoc().line, node->getDeclSymbol()->getLoc().getFilename());
         // We touch the symbol once here to create the debug info.
@@ -7079,7 +7138,17 @@ spv::Id TGlslangToSpvTraverser::makeHeapOffsetId(const glslang::TType& type)
 //  - do conversion of concrete to abstract type
 spv::Id TGlslangToSpvTraverser::accessChainLoad(const glslang::TType& type)
 {
+    const spv::Builder::AccessChain chain = builder.getAccessChain();
+    if (chain.base == spv::NoResult) {
+        failInvalidTree("access-chain load without a base result");
+        return spv::NoResult;
+    }
+
     spv::Id nominalTypeId = builder.accessChainGetInferredType();
+    if (nominalTypeId == spv::NoType && chain.descHeapInfo.descHeapIndexChain.empty()) {
+        failInvalidTree("access-chain load without an inferred type");
+        return spv::NoResult;
+    }
 
     spv::Builder::AccessChain::CoherentFlags coherentFlags = builder.getAccessChain().coherentFlags;
     coherentFlags |= TranslateCoherent(type);
@@ -7104,6 +7173,11 @@ spv::Id TGlslangToSpvTraverser::accessChainLoad(const glslang::TType& type)
         accessMask,
         TranslateMemoryScope(coherentFlags),
         alignment);
+
+    if (loadedId == spv::NoResult) {
+        failInvalidTree("access-chain load produced no result");
+        return spv::NoResult;
+    }
 
     // Need to convert to abstract types when necessary
     if (type.getBasicType() == glslang::EbtBool) {
@@ -7657,6 +7731,11 @@ void TGlslangToSpvTraverser::translateArguments(const glslang::TIntermAggregate&
         builder.clearAccessChain();
         glslangArguments[i]->traverse(this);
 
+        if (invalidTree)
+            failInvalidTree("invalid AST while translating function argument");
+        if (builder.getAccessChain().base == spv::NoResult)
+            failInvalidTree("function argument produced no access-chain result");
+
         // Special case l-value operands
         bool lvalue = false;
         switch (node.getOp()) {
@@ -7780,7 +7859,10 @@ void TGlslangToSpvTraverser::translateArguments(const glslang::TIntermAggregate&
                 spv::Id id = arguments[i-1];
                 arguments.push_back(id);
             } else {
-                arguments.push_back(accessChainLoad(glslangArguments[i]->getAsTyped()->getType()));
+                spv::Id value = accessChainLoad(glslangArguments[i]->getAsTyped()->getType());
+                if (invalidTree)
+                    return;
+                arguments.push_back(value);
             }
         }
     }
@@ -7790,7 +7872,12 @@ void TGlslangToSpvTraverser::translateArguments(glslang::TIntermUnary& node, std
 {
     builder.clearAccessChain();
     node.getOperand()->traverse(this);
-    arguments.push_back(accessChainLoad(node.getOperand()->getType()));
+    if (invalidTree)
+        return;
+    spv::Id value = accessChainLoad(node.getOperand()->getType());
+    if (invalidTree)
+        return;
+    arguments.push_back(value);
 }
 
 spv::Id TGlslangToSpvTraverser::createImageTextureFunctionCall(glslang::TIntermOperator* node)
@@ -7823,10 +7910,15 @@ spv::Id TGlslangToSpvTraverser::createImageTextureFunctionCall(glslang::TIntermO
     spv::Builder::AccessChain::CoherentFlags lvalueCoherentFlags;
 
     std::vector<spv::Id> arguments;
-    if (node->getAsAggregate())
+    if (node->getAsAggregate()) {
         translateArguments(*node->getAsAggregate(), arguments, lvalueCoherentFlags);
-    else
+        if (invalidTree)
+            return spv::NoResult;
+    } else {
         translateArguments(*node->getAsUnaryNode(), arguments);
+        if (invalidTree)
+            return spv::NoResult;
+    }
     spv::Decoration precision = TranslatePrecisionDecoration(node->getType());
 
     spv::Builder::TextureParameters params = { };
@@ -8509,6 +8601,14 @@ spv::Id TGlslangToSpvTraverser::createBinaryOperation(glslang::TOperator op, OpD
                                                       spv::Id typeId, spv::Id left, spv::Id right,
                                                       glslang::TBasicType typeProxy, bool reduceComparison)
 {
+    if (left == spv::NoResult || right == spv::NoResult || typeId == spv::NoType) {
+        failInvalidTree("binary operation received an invalid operand");
+        return spv::NoResult;
+    }
+    if (builder.getTypeId(left) == spv::NoType || builder.getTypeId(right) == spv::NoType) {
+        failInvalidTree("binary operation received an untyped operand");
+        return spv::NoResult;
+    }
     bool isUnsigned = isTypeUnsignedInt(typeProxy);
     bool isFloat = isTypeFloat(typeProxy);
     bool isBool = typeProxy == glslang::EbtBool;
@@ -8794,6 +8894,10 @@ spv::Id TGlslangToSpvTraverser::createBinaryOperation(glslang::TOperator op, OpD
 spv::Id TGlslangToSpvTraverser::createBinaryMatrixOperation(spv::Op op, OpDecorations& decorations, spv::Id typeId,
                                                             spv::Id left, spv::Id right)
 {
+    if (left == spv::NoResult || right == spv::NoResult || typeId == spv::NoType) {
+        failInvalidTree("matrix operation received an invalid operand");
+        return spv::NoResult;
+    }
     bool firstClass = true;
 
     // First, handle first-class matrix operations (* and matrix/scalar)
@@ -8894,6 +8998,14 @@ spv::Id TGlslangToSpvTraverser::createUnaryOperation(glslang::TOperator op, OpDe
     spv::Id operand, glslang::TBasicType typeProxy, const spv::Builder::AccessChain::CoherentFlags &lvalueCoherentFlags,
     const glslang::TType &opType)
 {
+    if (operand == spv::NoResult || typeId == spv::NoType) {
+        failInvalidTree("unary operation received an invalid operand");
+        return spv::NoResult;
+    }
+    if (builder.getTypeId(operand) == spv::NoType) {
+        failInvalidTree("unary operation received an untyped operand");
+        return spv::NoResult;
+    }
     spv::Op unaryOp = spv::Op::OpNop;
     int extBuiltins = -1;
     int libCall = -1;
@@ -9653,6 +9765,14 @@ spv::Id TGlslangToSpvTraverser::createIntWidthConversion(spv::Id operand, int ve
 spv::Id TGlslangToSpvTraverser::createConversion(glslang::TOperator op, OpDecorations& decorations, spv::Id destType,
                                                  spv::Id operand, glslang::TBasicType resultBasicType, glslang::TBasicType operandBasicType)
 {
+    if (operand == spv::NoResult || destType == spv::NoType) {
+        failInvalidTree("conversion received an invalid operand");
+        return spv::NoResult;
+    }
+    if (builder.getTypeId(operand) == spv::NoType) {
+        failInvalidTree("conversion received an untyped operand");
+        return spv::NoResult;
+    }
     spv::Op convOp = spv::Op::OpNop;
     spv::Id zero = 0;
     spv::Id one = 0;
@@ -10672,6 +10792,13 @@ spv::Id TGlslangToSpvTraverser::createSubgroupOperation(glslang::TOperator op, s
 spv::Id TGlslangToSpvTraverser::createMiscOperation(glslang::TOperator op, spv::Decoration precision,
     spv::Id typeId, std::vector<spv::Id>& operands, glslang::TBasicType typeProxy)
 {
+    for (spv::Id operand : operands) {
+        if (operand == spv::NoResult || builder.getTypeId(operand) == spv::NoType) {
+            failInvalidTree("misc operation received an invalid operand");
+            return spv::NoResult;
+        }
+    }
+
     bool isUnsigned = isTypeUnsignedInt(typeProxy);
     bool isFloat = isTypeFloat(typeProxy);
 
@@ -12684,6 +12811,10 @@ void GlslangToSpv(const TIntermediate& intermediate, std::vector<unsigned int>& 
 
     TGlslangToSpvTraverser it(intermediate.getSpv().spv, &intermediate, logger, *options);
     root->traverse(&it);
+    if (it.hasInvalidTree()) {
+        GetThreadPoolAllocator().pop();
+        return;
+    }
     it.finishSpv(options->compileOnly);
     it.dumpSpv(spirv);
 

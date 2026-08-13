@@ -124,6 +124,14 @@ void C_DECL TParseContextBase::ppWarn(const TSourceLoc& loc, const char* szReaso
 //
 bool TParseContextBase::lValueErrorCheck(const TSourceLoc& loc, const char* op, TIntermTyped* node)
 {
+    // Error recovery can hand the parser a null expression after an earlier
+    // syntax/type diagnostic.  Keep the diagnostic path fail-closed instead
+    // of dereferencing it while reporting the original l-value error.
+    if (node == nullptr) {
+        error(loc, " l-value required", op, "", "");
+        return true;
+    }
+
     TIntermBinary* binaryNode = node->getAsBinaryNode();
 
     const char* symbol = nullptr;

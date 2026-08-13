@@ -4190,6 +4190,15 @@ void TParseContext::variableCheck(TIntermTyped*& nodePtr)
 //
 bool TParseContext::lValueErrorCheck(const TSourceLoc& loc, const char* op, TIntermTyped* node)
 {
+    // Match the base parser's fail-closed recovery path.  Invalid Minecraft
+    // shader expressions may reach this callback as null after a prior
+    // diagnostic; never turn that recoverable compile failure into a native
+    // crash inside the wrapper.
+    if (node == nullptr) {
+        error(loc, " l-value required", op, "", "");
+        return true;
+    }
+
     TIntermBinary* binaryNode = node->getAsBinaryNode();
 
     if (binaryNode) {
@@ -4213,16 +4222,35 @@ bool TParseContext::lValueErrorCheck(const TSourceLoc& loc, const char* op, TInt
             }
             break; // left node is checked by base class
         case EOpVectorSwizzle:
+            if (binaryNode->getLeft() == nullptr || binaryNode->getRight() == nullptr) {
+                error(loc, " l-value required", op, "", "");
+                return true;
+            }
             errorReturn = lValueErrorCheck(loc, op, binaryNode->getLeft());
             if (!errorReturn) {
                 int offset[4] = {0,0,0,0};
 
                 TIntermTyped* rightNode = binaryNode->getRight();
                 TIntermAggregate *aggrNode = rightNode->getAsAggregate();
+                if (aggrNode == nullptr) {
+                    error(loc, " l-value required", op, "", "");
+                    return true;
+                }
 
                 for (TIntermSequence::iterator p = aggrNode->getSequence().begin();
                                                p != aggrNode->getSequence().end(); p++) {
-                    int value = (*p)->getAsTyped()->getAsConstantUnion()->getConstArray()[0].getIConst();
+                    TIntermTyped* selector = *p != nullptr ? (*p)->getAsTyped() : nullptr;
+                    TIntermConstantUnion* constant = selector != nullptr
+                        ? selector->getAsConstantUnion() : nullptr;
+                    if (constant == nullptr) {
+                        error(loc, " l-value required", op, "", "");
+                        return true;
+                    }
+                    int value = constant->getConstArray()[0].getIConst();
+                    if (value < 0 || value >= 4) {
+                        error(loc, " l-value required", op, "", "");
+                        return true;
+                    }
                     offset[value]++;
                     if (offset[value] > 1) {
                         error(loc, " l-value of swizzle cannot have duplicate components", op, "", "");
@@ -4243,8 +4271,11 @@ bool TParseContext::lValueErrorCheck(const TSourceLoc& loc, const char* op, TInt
         }
     }
 
-    if (binaryNode && binaryNode->getOp() == EOpIndexDirectStruct && binaryNode->getLeft()->isReference())
-        return false;
+    if (binaryNode && binaryNode->getOp() == EOpIndexDirectStruct) {
+        TIntermTyped* left = binaryNode->getLeft();
+        if (left != nullptr && left->isReference())
+            return false;
+    }
 
     // Let the base class check errors
     if (TParseContextBase::lValueErrorCheck(loc, op, node))

@@ -1750,7 +1750,15 @@ unsigned int Builder::getNumTypeConstituents(Id typeId) const
 // However, it includes returning a structure, if say, it is an array of structure.
 Id Builder::getScalarTypeId(Id typeId) const
 {
+    // Front-end error recovery can leave a partially translated expression
+    // with NoType/NoResult.  Treat it as an unavailable type instead of
+    // dereferencing the null instruction slot in the module id table.
+    if (typeId == NoType || typeId == NoResult)
+        return NoResult;
+
     Instruction* instr = module.getInstruction(typeId);
+    if (instr == nullptr)
+        return NoResult;
 
     Op typeClass = instr->getOpCode();
     switch (typeClass)
@@ -3790,6 +3798,23 @@ Id Builder::createLvalueSwizzle(Id typeId, Id target, Id source, const std::vect
 // Comments in header
 void Builder::promoteScalar(Decoration precision, Id& left, Id& right)
 {
+    // A malformed front-end tree can leave an operand without an SPIR-V
+    // result.  Do not query the module type table for NoResult; propagate the
+    // failure to the caller so the traverser can reject this shader.
+    if (left == NoResult || right == NoResult) {
+        left = NoResult;
+        right = NoResult;
+        return;
+    }
+
+    const Id leftType = getTypeId(left);
+    const Id rightType = getTypeId(right);
+    if (leftType == NoType || rightType == NoType) {
+        left = NoResult;
+        right = NoResult;
+        return;
+    }
+
     // choose direction of promotion (+1 for left to right, -1 for right to left)
     int direction = !isScalar(right) - !isScalar(left);
 
@@ -4819,6 +4844,9 @@ Id Builder::accessChainLoad(Decoration precision, Decoration l_nonUniform,
     Decoration r_nonUniform, Id resultType, spv::MemoryAccessMask memoryAccess,
     spv::Scope scope, unsigned int alignment)
 {
+    if (accessChain.base == NoResult)
+        return NoResult;
+
     Id id;
 
     if (accessChain.isRValue) {
@@ -4889,6 +4917,11 @@ Id Builder::accessChainLoad(Decoration precision, Decoration l_nonUniform,
         addDecoration(id, r_nonUniform);
     }
 
+    // Front-end error recovery can produce an empty load.  Do not ask the
+    // type table to classify it or continue lowering a malformed swizzle.
+    if (id == NoResult)
+        return NoResult;
+
     // Done, unless there are swizzles to do
     if (accessChain.swizzle.size() == 0 && accessChain.component == NoResult)
         return id;
@@ -4897,7 +4930,12 @@ Id Builder::accessChainLoad(Decoration precision, Decoration l_nonUniform,
 
     // Do the basic swizzle
     if (accessChain.swizzle.size() > 0) {
-        Id swizzledType = getScalarTypeId(getTypeId(id));
+        Id valueType = getTypeId(id);
+        if (valueType == NoType)
+            return NoResult;
+        Id swizzledType = getScalarTypeId(valueType);
+        if (swizzledType == NoType || swizzledType == NoResult)
+            return NoResult;
         if (accessChain.swizzle.size() > 1)
             swizzledType = makeVectorType(swizzledType, (int)accessChain.swizzle.size());
         id = createRvalueSwizzle(precision, swizzledType, id, accessChain.swizzle);
