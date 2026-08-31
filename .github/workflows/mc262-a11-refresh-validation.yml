@@ -1,0 +1,152 @@
+name: Minecraft 26.2 A11 glslang refresh validation
+
+on:
+  push:
+    branches:
+      - ci/mc262-upstream-refresh-a11-20260831
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sanitize-and-rebase:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout refreshed upstream candidate
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Cherry-pick Minecraft malformed-AST fail-closed patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin fix/mc262-malformed-ast-fail-closed
+          git cherry-pick 304ef30ef0de76e023ef2b60c1406a042c6ef8df
+          git diff --check HEAD^ HEAD
+
+      - name: Configure ASan and UBSan glslang
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-sanitize -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DENABLE_OPT=OFF \
+            -DENABLE_GLSLANG_BINARIES=ON \
+            -DENABLE_SPVREMAPPER=OFF \
+            -DBUILD_TESTING=ON \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_C_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' \
+            -DCMAKE_CXX_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' \
+            -DCMAKE_EXE_LINKER_FLAGS='-fsanitize=address,undefined'
+          cmake --build build-sanitize --parallel 2 --target glslang-standalone glslangtests
+
+      - name: Run malformed GLSL crash corpus under sanitizers
+        shell: bash
+        run: |
+          set -euo pipefail
+          V=build-sanitize/StandAlone/glslang
+          test -x "$V"
+          mkdir -p /tmp/mc262-glsl-corpus /tmp/mc262-glsl-logs
+
+          cat > /tmp/mc262-glsl-corpus/upstream-4017.frag <<'EOF'
+          #version 450
+          void main() {
+              const struct { float boom; } varname = {};
+              float oops = varname.boom;
+          }
+          EOF
+
+          cat > /tmp/mc262-glsl-corpus/lvalue-duplicate-swizzle.frag <<'EOF'
+          #version 450
+          layout(location=0) out vec4 color;
+          void main() {
+              vec4 v = vec4(0.0);
+              v.xx = vec2(1.0);
+              color = v;
+          }
+          EOF
+
+          cat > /tmp/mc262-glsl-corpus/lvalue-invalid-swizzle.frag <<'EOF'
+          #version 450
+          layout(location=0) out vec4 color;
+          void main() {
+              vec4 v = vec4(0.0);
+              v.xm = vec2(1.0);
+              color = v;
+          }
+          EOF
+
+          cat > /tmp/mc262-glsl-corpus/lvalue-rvalue.frag <<'EOF'
+          #version 450
+          layout(location=0) out vec4 color;
+          void main() {
+              (vec4(1.0)).xy = vec2(0.0);
+              color = vec4(1.0);
+          }
+          EOF
+
+          cat > /tmp/mc262-glsl-corpus/lvalue-out-param.frag <<'EOF'
+          #version 450
+          layout(location=0) out vec4 color;
+          void write2(out vec2 x) { x = vec2(1.0); }
+          void main() {
+              write2((vec4(0.0)).xy);
+              color = vec4(1.0);
+          }
+          EOF
+
+          cat > /tmp/mc262-glsl-corpus/parser-recovery.frag <<'EOF'
+          #version 450
+          layout(location=0) out vec4 color;
+          void main() {
+              vec4 v = vec4(0.0);
+              v. = vec2(1.0);
+              color = v;
+          }
+          EOF
+
+          failed=0
+          for shader in /tmp/mc262-glsl-corpus/*.frag; do
+            name=$(basename "$shader")
+            set +e
+            ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 \
+            UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+              "$V" -V --target-env vulkan1.2 -S frag "$shader" -o "/tmp/${name}.spv" \
+              > "/tmp/mc262-glsl-logs/${name}.log" 2>&1
+            rc=$?
+            set -e
+            echo "$name rc=$rc"
+            cat "/tmp/mc262-glsl-logs/${name}.log"
+            if [ "$rc" -ge 128 ]; then
+              echo "::error::$name terminated by signal-like exit code $rc"
+              failed=1
+            fi
+            if grep -Eq 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' "/tmp/mc262-glsl-logs/${name}.log"; then
+              echo "::error::sanitizer finding in $name"
+              failed=1
+            fi
+          done
+          test "$failed" -eq 0
+
+      - name: Run glslang test suite under sanitizers
+        shell: bash
+        run: |
+          set -euo pipefail
+          ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 \
+          UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+            ctest --test-dir build-sanitize --output-on-failure -j2
+
+      - name: Push validated candidate commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git push origin HEAD:ci/mc262-upstream-refresh-a11-20260831
+          echo "validated_sha=$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
