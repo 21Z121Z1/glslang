@@ -31,6 +31,13 @@ jobs:
           git cherry-pick 304ef30ef0de76e023ef2b60c1406a042c6ef8df
           git diff --check HEAD^ HEAD
 
+      - name: Fetch pinned GoogleTest dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(python3 -c "import json; print(next(x['commit'] for x in json.load(open('known_good.json'))['commits'] if x['name'] == 'googletest'))")" = "v1.14.0"
+          git clone --depth 1 --branch v1.14.0 https://github.com/google/googletest.git External/googletest
+
       - name: Configure ASan and UBSan glslang
         shell: bash
         run: |
@@ -39,8 +46,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DENABLE_OPT=OFF \
             -DENABLE_GLSLANG_BINARIES=ON \
-            -DENABLE_SPVREMAPPER=OFF \
-            -DBUILD_TESTING=ON \
+            -DGLSLANG_TESTS=ON \
             -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++ \
             -DCMAKE_C_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' \
