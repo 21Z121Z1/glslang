@@ -25,6 +25,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git fetch origin fix/mc262-malformed-ast-fail-closed
           git cherry-pick 304ef30ef0de76e023ef2b60c1406a042c6ef8df
           git diff --check HEAD^ HEAD
@@ -146,7 +148,5 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git push origin HEAD:ci/mc262-upstream-refresh-a11-20260831
           echo "validated_sha=$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
